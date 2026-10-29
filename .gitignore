@@ -1,29 +1,26 @@
-﻿# Python
 __pycache__/
 *.py[cod]
-*.pyo
-*.pyd
+*$py.class
+*.so
 .Python
-*.egg-info/
-dist/
 build/
-*.spec
-
-# Virtual environments
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
 .venv/
 venv/
-.ven/
-env/
-
-# Config personal (posiciones de ventanas)
-config.json
-
-# Logs
+ENV/
+*.blend1
+*.blend2
 *.log
-
-# PyInstaller
-*.exe
-
-# IDE
-.vscode/
-.idea/

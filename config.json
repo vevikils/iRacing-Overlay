@@ -1,0 +1,63 @@
+{
+    "opacity": 0.96,
+    "scale": 1.5,
+    "theme": "f1_2026_tv",
+    "sim_mode": false,
+    "overlays": {
+        "gear_overlay": {
+            "x": 6227,
+            "y": 1707,
+            "enabled": true
+        },
+        "inputs_overlay": {
+            "x": 7473,
+            "y": 1475,
+            "enabled": true
+        },
+        "delta_overlay": {
+            "x": 5641,
+            "y": 1688,
+            "enabled": true
+        },
+        "relative_overlay": {
+            "x": 5073,
+            "y": 1440,
+            "enabled": true
+        },
+        "radar_overlay": {
+            "x": 850,
+            "y": 460,
+            "enabled": true
+        },
+        "fuel_overlay": {
+            "x": 1724,
+            "y": 365,
+            "enabled": true
+        },
+        "tv2026_overlay": {
+            "x": 718,
+            "y": 225,
+            "enabled": true
+        },
+        "trophi_overlay": {
+            "x": 5642,
+            "y": 1430,
+            "enabled": true
+        },
+        "trackmap_overlay": {
+            "x": 7603,
+            "y": 102,
+            "enabled": true
+        },
+        "tires_overlay": {
+            "x": 4580,
+            "y": 1386,
+            "enabled": true
+        },
+        "standings_overlay": {
+            "x": 4472,
+            "y": 729,
+            "enabled": false
+        }
+    }
+}

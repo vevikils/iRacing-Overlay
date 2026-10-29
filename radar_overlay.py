@@ -1,252 +1,152 @@
+"""
+radar_overlay.py - SimHub / RaceLab / Helicorsa 3D Spatial Proximity Radar
+==========================================================================
+Author: vevi (VEVIkils556@gmail.com)
+Version: 3.5 Supreme (Blender 3D PBR + Resizable & Lockable + Clean Typography)
+"""
+
 import sys
 import time
-import os
-import ctypes
-from PyQt5.QtWidgets import QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame, QGridLayout
-from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal
-from PyQt5.QtGui import QColor, QFont
+import irsdk
+from PyQt5.QtWidgets import QApplication
+from PyQt5.QtCore import Qt, QTimer, QRectF, QPointF
+from PyQt5.QtGui import (
+    QPainter, QColor, QFont, QPen, QBrush, QRadialGradient
+)
+from overlay_utils import (
+    get_sim_telemetry, get_3d_asset, draw_elided_text,
+    ResizableLockableOverlay
+)
 
-import overlay_utils
+OVERLAY_KEY = "radar_overlay"
+BASE_W, BASE_H = 260, 260
 
-class RadarDataThread(QThread):
-    data_updated = pyqtSignal(dict)
 
+class RadarOverlay(ResizableLockableOverlay):
     def __init__(self):
-        super().__init__()
-        try:
-            import irsdk
-            self.ir = irsdk.IRSDK()
-        except:
-            self.ir = None
-        self.running = True
+        super().__init__(OVERLAY_KEY, BASE_W, BASE_H, default_x=850, default_y=460)
+        self.ir = irsdk.IRSDK()
+        self.is_connected = False
+        self._sim = get_sim_telemetry(time.time())
 
-    def run(self):
-        while self.running:
-            config = overlay_utils.load_config()
-            sim_mode = config.get("sim_mode", False)
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.update_telemetry)
+        self.timer.start(16)
 
-            if sim_mode:
-                t = time.time()
-                data = overlay_utils.get_sim_telemetry(t)
-                self.data_updated.emit(data)
-                time.sleep(1/30)
-                continue
+    def update_telemetry(self):
+        self.sync_window_from_config()
+        sim_data = get_sim_telemetry(time.time())
 
-            if not self.ir:
+        if not self._cfg.get("sim_mode", False):
+            if not self.is_connected:
+                if self.ir.startup():
+                    self.is_connected = True
+            elif not self.ir.is_initialized:
+                self.is_connected = False
+            if self.is_connected:
                 try:
-                    import irsdk
-                    self.ir = irsdk.IRSDK()
-                except:
-                    time.sleep(1)
-                    continue
+                    self.ir.freeze_var_buffer_latest()
+                    car_lr = int(self.ir["CarLeftRight"] or 0)
+                    sim_data["radar_left"] = 0.85 if car_lr in (2, 4, 5) else 0.0
+                    sim_data["radar_right"] = 0.85 if car_lr in (3, 4, 6) else 0.0
+                except Exception:
+                    pass
 
-            if not (self.ir.is_initialized and self.ir.is_connected):
-                if not self.ir.startup():
-                    time.sleep(1)
-                    continue
+        self._sim = sim_data
+        self.update()
 
-            try:
-                self.ir.freeze_var_buffer_latest()
-                car_lr = self.ir['CarLeftRight'] or 0
-                # 0=clear, 1=left, 2=right, 3=both, 4=2 cars left, 5=2 cars right
-                spot_l = car_lr in [1, 3, 4]
-                spot_r = car_lr in [2, 3, 5]
+    def paintEvent(self, event):
+        p = self.begin_overlay_painter()
 
-                self.data_updated.emit({
-                    'SpotterLeft': spot_l,
-                    'SpotterRight': spot_r,
-                    'CarLeftRight': car_lr
-                })
-            except:
-                pass
-            time.sleep(1/30)
+        d = self._sim
+        cx, cy = BASE_W / 2.0, BASE_H / 2.0
+        max_r = 114.0
 
-    def stop(self):
-        self.running = False
-        self.wait()
-
-class RadarOverlay(QWidget):
-    def __init__(self):
-        super().__init__()
-        self.script_dir = overlay_utils.get_base_path()
-        self.current_theme = ""
-        self.current_opacity = 0.0
-        self.current_locked = False
-        self.last_saved_x = -9999
-        self.last_saved_y = -9999
-        self.drag_pos = None
-
-        self.init_ui()
-        QTimer.singleShot(100, self.load_position)
-
-        self.data_thread = RadarDataThread()
-        self.data_thread.data_updated.connect(self.update_view)
-        self.data_thread.start()
-
-        self.config_timer = QTimer(self)
-        self.config_timer.timeout.connect(self.reload_settings)
-        self.config_timer.start(500)
-
-    def init_ui(self):
-        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
-        self.setAttribute(Qt.WA_TranslucentBackground)
-        self.setFixedSize(360, 100)
-
-        self.container = QFrame(self)
-        self.container.setGeometry(0, 0, 360, 100)
-        self.container.setObjectName("radarContainer")
-
-        layout = QHBoxLayout(self.container)
-        layout.setContentsMargins(12, 10, 12, 10)
-        layout.setSpacing(10)
-
-        # Left Radar indicator
-        self.left_indicator = QFrame()
-        self.left_indicator.setFixedWidth(100)
-        left_lay = QVBoxLayout(self.left_indicator)
-        left_lay.setAlignment(Qt.AlignCenter)
-        self.lbl_left = QLabel("◄ CAR LEFT")
-        self.lbl_left.setAlignment(Qt.AlignCenter)
-        self.lbl_left.setStyleSheet("font-size: 11px; font-weight: 900; color: #666666;")
-        left_lay.addWidget(self.lbl_left)
-        layout.addWidget(self.left_indicator)
-
-        # Center Car Representation
-        center_box = QFrame()
-        center_box.setFixedWidth(110)
-        center_lay = QVBoxLayout(center_box)
-        center_lay.setAlignment(Qt.AlignCenter)
-        center_lay.setSpacing(2)
-        
-        lbl_title = QLabel("PROXIMITY RADAR")
-        lbl_title.setStyleSheet("font-size: 8px; font-weight: 900; color: #888888; letter-spacing: 1px;")
-        lbl_title.setAlignment(Qt.AlignCenter)
-        
-        self.car_icon = QLabel("🏎️")
-        self.car_icon.setAlignment(Qt.AlignCenter)
-        self.car_icon.setStyleSheet("font-size: 24px;")
-
-        self.lbl_status = QLabel("CLEAR")
-        self.lbl_status.setAlignment(Qt.AlignCenter)
-        self.lbl_status.setStyleSheet("font-size: 10px; font-weight: 900; color: #34c759;")
-
-        center_lay.addWidget(lbl_title)
-        center_lay.addWidget(self.car_icon)
-        center_lay.addWidget(self.lbl_status)
-        layout.addWidget(center_box)
-
-        # Right Radar indicator
-        self.right_indicator = QFrame()
-        self.right_indicator.setFixedWidth(100)
-        right_lay = QVBoxLayout(self.right_indicator)
-        right_lay.setAlignment(Qt.AlignCenter)
-        self.lbl_right = QLabel("CAR RIGHT ►")
-        self.lbl_right.setAlignment(Qt.AlignCenter)
-        self.lbl_right.setStyleSheet("font-size: 11px; font-weight: 900; color: #666666;")
-        right_lay.addWidget(self.lbl_right)
-        layout.addWidget(self.right_indicator)
-
-        self.reload_settings()
-
-    def reload_settings(self):
-        config = overlay_utils.load_config()
-        opacity = config.get("opacity", 0.92)
-        if opacity != self.current_opacity:
-            self.setWindowOpacity(opacity)
-            self.current_opacity = opacity
-
-        locked = config.get("locked", False)
-        if locked != self.current_locked:
-            self.setAttribute(Qt.WA_TransparentForMouseEvents, locked)
-            self.current_locked = locked
-
-        pos = config.get('radar_overlay')
-        if pos:
-            if pos['x'] != self.last_saved_x or pos['y'] != self.last_saved_y:
-                self.move(pos['x'], pos['y'])
-                self.last_saved_x = pos['x']
-                self.last_saved_y = pos['y']
-
-        theme = config.get("theme", "racelab_pro")
-        if theme != self.current_theme:
-            self.current_theme = theme
-            colors = overlay_utils.get_theme_colors(theme)
-            self.container.setStyleSheet(f"""
-                #radarContainer {{
-                    background: {colors["bg_gradient"]};
-                    border: 1.5px solid {colors["border"]};
-                    border-radius: 10px;
-                }}
-            """)
-
-    def update_view(self, data):
-        spot_l = data.get('SpotterLeft', False)
-        spot_r = data.get('SpotterRight', False)
-
-        if spot_l:
-            self.left_indicator.setStyleSheet("background: rgba(255, 59, 48, 0.35); border: 1.5px solid #ff3b30; border-radius: 6px;")
-            self.lbl_left.setStyleSheet("font-size: 11px; font-weight: 900; color: #ffffff;")
+        # 1. Blender 3D Machined Titanium & Dark Glass Radar Scope (520x520 RGBA)
+        scope_pix = get_3d_asset("radar_scope_3d.png")
+        if not scope_pix.isNull():
+            p.drawPixmap(QRectF(4, 4, BASE_W - 8, BASE_H - 8), scope_pix, QRectF(0, 0, scope_pix.width(), scope_pix.height()))
         else:
-            self.left_indicator.setStyleSheet("background: rgba(255, 255, 255, 0.03); border: 1px solid rgba(255, 255, 255, 0.05); border-radius: 6px;")
-            self.lbl_left.setStyleSheet("font-size: 11px; font-weight: 900; color: #444444;")
+            rad_grad = QRadialGradient(cx, cy, max_r)
+            rad_grad.setColorAt(0.0, QColor(14, 18, 28, 215))
+            rad_grad.setColorAt(1.0, QColor(0, 245, 212, 80))
+            p.setBrush(QBrush(rad_grad))
+            p.setPen(QPen(QColor(255, 255, 255, 45), 1.5))
+            p.drawEllipse(QPointF(cx, cy), max_r, max_r)
 
-        if spot_r:
-            self.right_indicator.setStyleSheet("background: rgba(255, 59, 48, 0.35); border: 1.5px solid #ff3b30; border-radius: 6px;")
-            self.lbl_right.setStyleSheet("font-size: 11px; font-weight: 900; color: #ffffff;")
+        # Left & Right Proximity Warning Arcs
+        rl = d["radar_left"]
+        rr = d["radar_right"]
+        arc_rect = QRectF(cx - max_r + 12, cy - max_r + 12, (max_r - 12) * 2, (max_r - 12) * 2)
+
+        if rl > 0.05:
+            col_l = QColor("#EF4444") if rl > 0.55 else QColor("#F59E0B")
+            p.setPen(QPen(col_l, 9, Qt.SolidLine, Qt.RoundCap))
+            p.drawArc(arc_rect, 135 * 16, 90 * 16)
+
+        if rr > 0.05:
+            col_r = QColor("#EF4444") if rr > 0.55 else QColor("#F59E0B")
+            p.setPen(QPen(col_r, 9, Qt.SolidLine, Qt.RoundCap))
+            p.drawArc(arc_rect, -45 * 16, 90 * 16)
+
+        # 2. Center Player Car: 3D Blender Rendered FIA F4 Top-Down Single-Seater
+        player_car_pix = get_3d_asset("radar_3d_f4_player_car.png")
+        if not player_car_pix.isNull():
+            pw, ph = 56, 56
+            p.drawPixmap(
+                QRectF(cx - pw / 2.0, cy - ph / 2.0, pw, ph),
+                player_car_pix,
+                QRectF(0, 0, player_car_pix.width(), player_car_pix.height())
+            )
         else:
-            self.right_indicator.setStyleSheet("background: rgba(255, 255, 255, 0.03); border: 1px solid rgba(255, 255, 255, 0.05); border-radius: 6px;")
-            self.lbl_right.setStyleSheet("font-size: 11px; font-weight: 900; color: #444444;")
+            car_w, car_h = 24, 48
+            car_rect = QRectF(cx - car_w / 2.0, cy - car_h / 2.0, car_w, car_h)
+            p.setBrush(QColor("#00F5D4"))
+            p.setPen(QPen(QColor("#FFFFFF"), 1.6))
+            p.drawRoundedRect(car_rect, 6, 6)
 
-        if spot_l and spot_r:
-            self.lbl_status.setText("3 WIDE!")
-            self.lbl_status.setStyleSheet("font-size: 10px; font-weight: 900; color: #ff0054;")
-        elif spot_l:
-            self.lbl_status.setText("HOLD RIGHT")
-            self.lbl_status.setStyleSheet("font-size: 10px; font-weight: 900; color: #ff9f1c;")
-        elif spot_r:
-            self.lbl_status.setText("HOLD LEFT")
-            self.lbl_status.setStyleSheet("font-size: 10px; font-weight: 900; color: #ff9f1c;")
+        # 3. Opponent Spatial 3D FIA F4 Cars
+        opp_car_pix = get_3d_asset("radar_3d_f4_opponent_car.png")
+        for opp in d.get("radar_opponents", []):
+            ox = cx + opp["lat_m"] * 18.0
+            oy = cy - opp["long_m"] * 12.0
+            if not opp_car_pix.isNull():
+                ow, oh = 52, 52
+                p.drawPixmap(
+                    QRectF(ox - ow / 2.0, oy - oh / 2.0, ow, oh),
+                    opp_car_pix,
+                    QRectF(0, 0, opp_car_pix.width(), opp_car_pix.height())
+                )
+            else:
+                o_rect = QRectF(ox - 12, oy - 24, 24, 48)
+                danger_col = QColor("#EF4444") if opp["danger"] > 0.55 else QColor("#F59E0B")
+                p.setBrush(danger_col)
+                p.setPen(QPen(QColor("#FFFFFF"), 1.4))
+                p.drawRoundedRect(o_rect, 5, 5)
+
+        # Spotter Callout Pill at Top (Clean ASCII/Latin, zero strange arrow symbols)
+        if rl > 0.2 and rr > 0.2:
+            spot_txt, spot_col = "[!] 3-WIDE ALERT [!]", "#EF4444"
+        elif rl > 0.1:
+            spot_txt, spot_col = "<< CAR LEFT", "#EF4444" if rl > 0.55 else "#F59E0B"
+        elif rr > 0.1:
+            spot_txt, spot_col = "CAR RIGHT >>", "#EF4444" if rr > 0.55 else "#F59E0B"
         else:
-            self.lbl_status.setText("CLEAR")
-            self.lbl_status.setStyleSheet("font-size: 10px; font-weight: 900; color: #2ec4b6;")
+            spot_txt, spot_col = "CLEAR ALL AROUND", "#10B981"
 
-    def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton and not self.testAttribute(Qt.WA_TransparentForMouseEvents):
-            self.drag_pos = event.globalPos() - self.frameGeometry().topLeft()
-            event.accept()
+        pill = QRectF(cx - 72, 22, 144, 22)
+        p.setBrush(QColor(12, 15, 22, 235))
+        p.setPen(QPen(QColor(spot_col), 1.4))
+        p.drawRoundedRect(pill, 6, 6)
+        p.setPen(QColor(spot_col))
+        p.setFont(QFont("Segoe UI", 7, QFont.Black))
+        draw_elided_text(p, pill, Qt.AlignCenter, spot_txt)
 
-    def mouseMoveEvent(self, event):
-        if event.buttons() == Qt.LeftButton and self.drag_pos and not self.testAttribute(Qt.WA_TransparentForMouseEvents):
-            self.move(event.globalPos() - self.drag_pos)
-            event.accept()
+        self.end_overlay_painter(p)
 
-    def mouseReleaseEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            self.drag_pos = None
-            self.save_position()
-            event.accept()
 
-    def save_position(self):
-        config = overlay_utils.load_config()
-        config['radar_overlay'] = {'x': self.x(), 'y': self.y()}
-        self.last_saved_x = self.x()
-        self.last_saved_y = self.y()
-        overlay_utils.save_config(config)
-
-    def load_position(self):
-        config = overlay_utils.load_config()
-        pos = config.get('radar_overlay')
-        if pos:
-            self.move(pos['x'], pos['y'])
-            self.last_saved_x = pos['x']
-            self.last_saved_y = pos['y']
-
-    def closeEvent(self, event):
-        self.data_thread.stop()
-        event.accept()
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     app = QApplication(sys.argv)
-    overlay = RadarOverlay()
-    overlay.show()
+    win = RadarOverlay()
+    win.show()
     sys.exit(app.exec_())

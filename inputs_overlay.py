@@ -1,375 +1,170 @@
+"""
+inputs_overlay.py - RaceLab / SimHub Pro Pedal Telemetry, Trace & 3D Steering Wheel
+===================================================================================
+Author: vevi (VEVIkils556@gmail.com)
+Version: 3.5 Supreme (Blender 3D PBR + Resizable & Lockable + Clean Typography)
+"""
+
 import sys
+import math
 import time
-import ctypes
-from PyQt5.QtWidgets import QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame, QGraphicsDropShadowEffect
-from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QPointF
-from PyQt5.QtGui import QPainter, QColor, QPen, QLinearGradient, QFont, QPainterPath, QBrush
-import os
-import json
+from collections import deque
+import irsdk
+from PyQt5.QtWidgets import QApplication
+from PyQt5.QtCore import Qt, QTimer, QRectF, QPointF
+from PyQt5.QtGui import (
+    QPainter, QColor, QFont, QPen, QPainterPath
+)
+from overlay_utils import (
+    get_sim_telemetry, get_3d_asset, draw_3d_card_bezel, draw_elided_text,
+    ResizableLockableOverlay
+)
 
-# Import shared utilities
-import overlay_utils
+OVERLAY_KEY = "inputs_overlay"
+BASE_W, BASE_H = 510, 175
+HISTORY_LEN = 160
 
-class TelemetryDataThread(QThread):
-    data_updated = pyqtSignal(dict)
 
+class InputsOverlay(ResizableLockableOverlay):
     def __init__(self):
-        super().__init__()
-        try:
-            import irsdk
-            self.ir = irsdk.IRSDK()
-        except:
-            self.ir = None
-        self.running = True
+        super().__init__(OVERLAY_KEY, BASE_W, BASE_H, default_x=380, default_y=800)
+        self.ir = irsdk.IRSDK()
+        self.is_connected = False
 
-    def run(self):
-        while self.running:
-            config = overlay_utils.load_config()
-            sim_mode = config.get("sim_mode", False)
+        self.thr_hist = deque([0.0] * HISTORY_LEN, maxlen=HISTORY_LEN)
+        self.brk_hist = deque([0.0] * HISTORY_LEN, maxlen=HISTORY_LEN)
+        now = time.time()
+        for i in range(HISTORY_LEN):
+            s = get_sim_telemetry(now - (HISTORY_LEN - i) * 0.032)
+            self.thr_hist.append(s["throttle"])
+            self.brk_hist.append(s["brake"])
 
-            if sim_mode:
-                data = overlay_utils.get_sim_telemetry(time.time())
-                self.data_updated.emit(data)
-                time.sleep(1/60) # 60 FPS for ultra-smooth graphs
-                continue
+        self._sim = get_sim_telemetry(now)
 
-            if not self.ir:
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.update_telemetry)
+        self.timer.start(16)
+
+    def update_telemetry(self):
+        self.sync_window_from_config()
+        sim_data = get_sim_telemetry(time.time())
+
+        if not self._cfg.get("sim_mode", False):
+            if not self.is_connected:
+                if self.ir.startup():
+                    self.is_connected = True
+            elif not self.ir.is_initialized:
+                self.is_connected = False
+            if self.is_connected:
                 try:
-                    import irsdk
-                    self.ir = irsdk.IRSDK()
-                except:
-                    time.sleep(1)
-                    continue
+                    self.ir.freeze_var_buffer_latest()
+                    sim_data["throttle"] = float(self.ir["Throttle"] or 0.0)
+                    sim_data["brake"] = float(self.ir["Brake"] or 0.0)
+                    sim_data["clutch"] = 1.0 - float(self.ir["Clutch"] or 1.0)
+                    sim_data["steer_deg"] = -math.degrees(float(self.ir["SteeringWheelAngle"] or 0.0))
+                except Exception:
+                    pass
 
-            is_connected = self.ir.is_initialized and self.ir.is_connected
-            if not is_connected:
-                if not self.ir.startup():
-                    time.sleep(1)
-                    continue
-
-            try:
-                self.ir.freeze_var_buffer_latest()
-                
-                t = self.ir['Throttle']
-                b = self.ir['Brake']
-                c = self.ir['Clutch']
-                
-                data = {
-                    'Throttle': float(t) if t is not None else 0.0,
-                    'Brake': float(b) if b is not None else 0.0,
-                    'Clutch': float(c) if c is not None else 0.0,
-                }
-                self.data_updated.emit(data)
-            except Exception as e:
-                pass
-                
-            time.sleep(1/60)
-
-    def stop(self):
-        self.running = False
-        self.wait()
-
-class TelemetryHistoryWidget(QWidget):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.history_throttle = [0.0] * 120
-        self.history_brake = [0.0] * 120
-        self.theme_colors = None
-        self.setFixedHeight(100)
-        self.setMinimumWidth(320)
-
-    def set_theme_colors(self, colors):
-        self.theme_colors = colors
-        self.update()
-
-    def update_history(self, throttle, brake):
-        self.history_throttle.pop(0)
-        self.history_throttle.append(throttle)
-        self.history_brake.pop(0)
-        self.history_brake.append(brake)
+        self.thr_hist.append(sim_data["throttle"])
+        self.brk_hist.append(sim_data["brake"])
+        self._sim = sim_data
         self.update()
 
     def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
-        
-        # Fondo oscuro del gráfico
-        painter.fillRect(self.rect(), QColor(5, 5, 5, 120))
-        
-        width = self.width()
-        height = self.height()
-        points = len(self.history_throttle)
-        dx = width / (points - 1)
+        p = self.begin_overlay_painter()
 
-        # 1. Dibujar líneas de rejilla (Grid)
-        pen_grid = QPen(QColor(255, 255, 255, 15), 1, Qt.DotLine)
-        painter.setPen(pen_grid)
-        
-        # Grid horizontal (25%, 50%, 75%)
-        for y_pct in [0.25, 0.50, 0.75]:
-            y_pos = int(height * y_pct)
-            painter.drawLine(0, y_pos, width, y_pos)
-            
-        # Grid vertical (divisiones temporales)
-        for i in range(1, 4):
-            x_pos = int(width * (i / 4.0))
-            painter.drawLine(x_pos, 0, x_pos, height)
+        d = self._sim
+        if not draw_3d_card_bezel(p, 4, 4, BASE_W - 8, BASE_H - 8):
+            bg_path = QPainterPath()
+            bg_path.addRoundedRect(QRectF(6, 6, BASE_W - 12, BASE_H - 12), 12, 12)
+            p.fillPath(bg_path, QColor(12, 15, 22, 240))
 
-        # Colores por defecto si no se han establecido
-        throttle_color = QColor(overlay_utils.get_theme_colors("classic_red")["chart_throttle"])
-        brake_color = QColor(overlay_utils.get_theme_colors("classic_red")["chart_brake"])
-        
-        if self.theme_colors:
-            throttle_color = QColor(self.theme_colors["chart_throttle"])
-            brake_color = QColor(self.theme_colors["chart_brake"])
+        # 1. Scrolling Telemetry Trace Area (Left)
+        gx, gy, gw, gh = 16, 16, 285, BASE_H - 32
+        p.setBrush(QColor(18, 22, 32, 230))
+        p.setPen(QPen(QColor(255, 255, 255, 30), 1.0))
+        p.drawRoundedRect(QRectF(gx, gy, gw, gh), 8, 8)
 
-        # 2. Dibujar áreas rellenas con degradado
-        # Relleno del Freno (Rojo)
-        path_brake_fill = QPainterPath()
-        path_brake_fill.moveTo(0, height)
-        for i in range(points):
-            x = i * dx
-            y = height - (self.history_brake[i] * height * 0.96) # 0.96 para evitar recortes arriba
-            path_brake_fill.lineTo(x, y)
-        path_brake_fill.lineTo(width, height)
-        path_brake_fill.closeSubpath()
-        
-        grad_brake = QLinearGradient(0, 0, 0, height)
-        grad_brake.setColorAt(0, QColor(brake_color.red(), brake_color.green(), brake_color.blue(), 60))
-        grad_brake.setColorAt(1, QColor(brake_color.red(), brake_color.green(), brake_color.blue(), 0))
-        painter.fillPath(path_brake_fill, QBrush(grad_brake))
+        # Dedicated Header Strip inside plot so traces never touch the title text
+        p.fillRect(QRectF(gx + 2, gy + 2, gw - 4, 16), QColor(14, 18, 28, 220))
+        p.setPen(QColor("#8E96AA"))
+        p.setFont(QFont("Segoe UI", 7, QFont.Bold))
+        draw_elided_text(p, QRectF(gx + 8, gy + 3, 180, 14), Qt.AlignLeft | Qt.AlignVCenter, "INPUT TELEMETRY | 60Hz")
 
-        # Relleno del Acelerador (Verde)
-        path_throttle_fill = QPainterPath()
-        path_throttle_fill.moveTo(0, height)
-        for i in range(points):
-            x = i * dx
-            y = height - (self.history_throttle[i] * height * 0.96)
-            path_throttle_fill.lineTo(x, y)
-        path_throttle_fill.lineTo(width, height)
-        path_throttle_fill.closeSubpath()
-        
-        grad_throttle = QLinearGradient(0, 0, 0, height)
-        grad_throttle.setColorAt(0, QColor(throttle_color.red(), throttle_color.green(), throttle_color.blue(), 60))
-        grad_throttle.setColorAt(1, QColor(throttle_color.red(), throttle_color.green(), throttle_color.blue(), 0))
-        painter.fillPath(path_throttle_fill, QBrush(grad_throttle))
+        plot_y = gy + 20
+        plot_h = gh - 26
+        p.setPen(QPen(QColor(255, 255, 255, 20), 1.0, Qt.DashLine))
+        for f in (0.25, 0.5, 0.75):
+            p.drawLine(int(gx + 4), int(plot_y + plot_h * f), int(gx + gw - 4), int(plot_y + plot_h * f))
 
-        # 3. Dibujar las líneas de contorno gruesas
-        # Línea de Freno
-        pen_brake_line = QPen(brake_color, 2, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
-        painter.setPen(pen_brake_line)
-        path_brake = QPainterPath()
-        path_brake.moveTo(0, height - (self.history_brake[0] * height * 0.96))
-        for i in range(1, points):
-            path_brake.lineTo(i * dx, height - (self.history_brake[i] * height * 0.96))
-        painter.drawPath(path_brake)
+        def build_curve(arr):
+            path = QPainterPath()
+            n = len(arr)
+            for idx, v in enumerate(arr):
+                px = gx + 6 + (idx / max(1, n - 1)) * (gw - 12)
+                py = plot_y + plot_h - max(0.0, min(1.0, v)) * plot_h
+                if idx == 0:
+                    path.moveTo(px, py)
+                else:
+                    path.lineTo(px, py)
+            return path
 
-        # Línea de Acelerador
-        pen_throttle_line = QPen(throttle_color, 2, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
-        painter.setPen(pen_throttle_line)
-        path_throttle = QPainterPath()
-        path_throttle.moveTo(0, height - (self.history_throttle[0] * height * 0.96))
-        for i in range(1, points):
-            path_throttle.lineTo(i * dx, height - (self.history_throttle[i] * height * 0.96))
-        painter.drawPath(path_throttle)
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(QColor("#00F58A"), 2.3))
+        p.drawPath(build_curve(self.thr_hist))
+        p.setPen(QPen(QColor("#FF1E38"), 2.5))
+        p.drawPath(build_curve(self.brk_hist))
 
-class InputOverlay(QWidget):
-    def __init__(self):
-        super().__init__()
-        self.script_dir = overlay_utils.get_base_path()
-        self.config_file = os.path.join(self.script_dir, "config.json")
-        
-        self.current_theme = ""
-        self.current_opacity = 0.0
-        self.current_locked = False
-        self.last_saved_x = -9999
-        self.last_saved_y = -9999
-        
-        self.init_ui()
-        QTimer.singleShot(100, self.load_position)
-        
-        self.data_thread = TelemetryDataThread()
-        self.data_thread.data_updated.connect(self.update_view)
-        self.data_thread.start()
-        
-        # Timer para recargar configuración dinámicamente
-        self.config_timer = QTimer(self)
-        self.config_timer.timeout.connect(self.reload_settings)
-        self.config_timer.start(500)
-        
-        self.drag_pos = None
+        # 2. Vertical Pedal Bars (C, B, T)
+        bx_start = gx + gw + 12
+        bars = [
+            ("C", d["clutch"], "#38BDF8"),
+            ("B", d["brake"], "#FF1E38"),
+            ("T", d["throttle"], "#00F58A"),
+        ]
+        bw = 22
+        bh = gh - 22
+        for idx, (lbl, val, col) in enumerate(bars):
+            bx = bx_start + idx * (bw + 8)
+            p.setBrush(QColor(24, 28, 40, 230))
+            p.setPen(QPen(QColor(255, 255, 255, 35), 1.0))
+            p.drawRoundedRect(QRectF(bx, gy, bw, bh), 4, 4)
 
-    def init_ui(self):
-        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
-        self.setAttribute(Qt.WA_TranslucentBackground)
-        
-        self.main_layout = QHBoxLayout()
-        self.main_layout.setContentsMargins(0, 0, 0, 0)
-        self.setLayout(self.main_layout)
+            fill_h = max(0.0, min(1.0, val)) * bh
+            p.setBrush(QColor(col))
+            p.setPen(Qt.NoPen)
+            p.drawRoundedRect(QRectF(bx, gy + bh - fill_h, bw, fill_h), 4, 4)
 
-        # Contenedor Principal
-        self.container = QFrame()
-        self.container.setObjectName("mainContainer")
-        self.main_layout.addWidget(self.container)
-        
-        container_layout = QHBoxLayout(self.container)
-        container_layout.setContentsMargins(12, 10, 12, 10)
-        container_layout.setSpacing(12)
-        
-        # Historial Gráfico
-        self.history_chart = TelemetryHistoryWidget()
-        container_layout.addWidget(self.history_chart)
-        
-        # Barras Verticales de Inputs (Acelerador, Freno, Embrague)
-        self.bars_layout = QHBoxLayout()
-        self.bars_layout.setSpacing(8)
-        
-        # Embrague (Clutch) - Barra Gris/Azul
-        self.clutch_bar_bg, self.clutch_bar_fill = self.create_bar("#8e8e93")
-        # Freno (Brake) - Barra Roja
-        self.brake_bar_bg, self.brake_bar_fill = self.create_bar("#ff3b30")
-        # Acelerador (Throttle) - Barra Verde
-        self.throttle_bar_bg, self.throttle_bar_fill = self.create_bar("#34c759")
-        
-        self.bars_layout.addWidget(self.clutch_bar_bg)
-        self.bars_layout.addWidget(self.brake_bar_bg)
-        self.bars_layout.addWidget(self.throttle_bar_bg)
-        
-        container_layout.addLayout(self.bars_layout)
-        
-        self.setGeometry(100, 600, 480, 120)
+            p.setPen(QColor("#FFFFFF"))
+            p.setFont(QFont("Consolas", 7, QFont.Black))
+            p.drawText(QRectF(bx - 4, gy + bh + 4, bw + 8, 16), Qt.AlignCenter, f"{int(val*100)}")
 
-    def create_bar(self, color):
-        # El contenedor (fondo de la barra) con estilo premium de cápsula
-        bg = QFrame()
-        bg.setFixedWidth(16)
-        bg.setFixedHeight(100)
-        bg.setStyleSheet("background: rgba(255, 255, 255, 0.06); border-radius: 8px;")
-        
-        # La barra que se llena (hija del contenedor)
-        fill = QFrame(bg)
-        fill.setFixedWidth(16)
-        fill.setStyleSheet(f"background: {color}; border-radius: 8px;")
-        fill.move(0, 100)
-        fill.setFixedHeight(0)
-        
-        return bg, fill
+        # 3. Rotating 3D F1 2026 Steering Wheel (Right)
+        sw_cx = BASE_W - 56
+        sw_cy = BASE_H / 2.0 - 8
+        r = 38
 
-    def reload_settings(self):
-        config = overlay_utils.load_config()
-        
-        # 1. Opacidad
-        opacity = config.get("opacity", 0.90)
-        if opacity != self.current_opacity:
-            self.setWindowOpacity(opacity)
-            self.current_opacity = opacity
+        p.save()
+        p.translate(sw_cx, sw_cy)
+        p.rotate(d["steer_deg"])
+        sw_pix = get_3d_asset("f1_2026_steering_wheel_3d.png")
+        if not sw_pix.isNull():
+            p.drawPixmap(QRectF(-r, -r, r * 2, r * 2), sw_pix, QRectF(0, 0, sw_pix.width(), sw_pix.height()))
+        else:
+            p.setBrush(Qt.NoBrush)
+            p.setPen(QPen(QColor("#00F5D4"), 2.0))
+            p.drawEllipse(QPointF(0, 0), r, r)
+        p.restore()
 
-        # 2. Bloqueo (Click-through)
-        locked = config.get("locked", False)
-        if locked != self.current_locked:
-            self.setAttribute(Qt.WA_TransparentForMouseEvents, locked)
-            self.current_locked = locked
+        p.setPen(QColor("#00F5D4"))
+        p.setFont(QFont("Consolas", 8, QFont.Bold))
+        p.drawText(QRectF(sw_cx - 44, sw_cy + r + 4, 88, 16), Qt.AlignCenter, f"{d['steer_deg']:+.1f} deg")
 
-        # 4. Comprobar si el lanzador restableció la posición
-        pos = config.get('inputs_overlay')
-        if pos:
-            if pos['x'] != self.last_saved_x or pos['y'] != self.last_saved_y:
-                self.move(pos['x'], pos['y'])
-                self.last_saved_x = pos['x']
-                self.last_saved_y = pos['y']
+        self.end_overlay_painter(p)
 
-        # 3. Aplicar Estilos del Tema
-        theme = config.get("theme", "classic_red")
-        if theme != self.current_theme:
-            self.current_theme = theme
-            colors = overlay_utils.get_theme_colors(theme)
-            
-            # Actualizar contenedor
-            self.container.setStyleSheet(f"""
-                #mainContainer {{
-                    background: {colors["bg_gradient"]};
-                    border: 1.5px solid {colors["border"]};
-                    border-radius: 10px;
-                }}
-            """)
-            
-            # Pasar colores al widget de gráfico
-            self.history_chart.set_theme_colors(colors)
-            
-            # Actualizar colores de las barras de inputs
-            self.throttle_bar_fill.setStyleSheet(f"background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 {colors['chart_throttle']}, stop:1 rgba(48, 209, 88, 120)); border-radius: 8px;")
-            self.brake_bar_fill.setStyleSheet(f"background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 {colors['chart_brake']}, stop:1 rgba(255, 69, 58, 120)); border-radius: 8px;")
-            self.clutch_bar_fill.setStyleSheet("background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #8e8e93, stop:1 rgba(142, 142, 147, 120)); border-radius: 8px;")
 
-    def update_view(self, data):
-        t = data.get('Throttle', 0.0)
-        b = data.get('Brake', 0.0)
-        c = data.get('Clutch', 0.0)
-        
-        # Actualizar Barras (0.0 a 1.0)
-        t_height = int(t * 100)
-        self.throttle_bar_fill.setFixedHeight(t_height)
-        self.throttle_bar_fill.move(0, 100 - t_height)
-        
-        b_height = int(b * 100)
-        self.brake_bar_fill.setFixedHeight(b_height)
-        self.brake_bar_fill.move(0, 100 - b_height)
-        
-        c_height = int(c * 100)
-        self.clutch_bar_fill.setFixedHeight(c_height)
-        self.clutch_bar_fill.move(0, 100 - c_height)
-        
-        # Actualizar Historial
-        self.history_chart.update_history(t, b)
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton and not self.testAttribute(Qt.WA_TransparentForMouseEvents):
-            self.drag_pos = event.globalPos() - self.frameGeometry().topLeft()
-            event.accept()
-        elif event.button() == Qt.RightButton:
-            is_transparent = self.testAttribute(Qt.WA_TransparentForMouseEvents)
-            self.setAttribute(Qt.WA_TransparentForMouseEvents, not is_transparent)
-            self.current_locked = not is_transparent
-            config = overlay_utils.load_config()
-            config["locked"] = not is_transparent
-            overlay_utils.save_config(config)
-            event.accept()
-
-    def mouseMoveEvent(self, event):
-        if event.buttons() == Qt.LeftButton and self.drag_pos and not self.testAttribute(Qt.WA_TransparentForMouseEvents):
-            self.move(event.globalPos() - self.drag_pos)
-            event.accept()
-
-    def mouseReleaseEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            self.drag_pos = None
-            self.save_position()
-            event.accept()
-
-    def save_position(self):
-        config = overlay_utils.load_config()
-        config['inputs_overlay'] = {
-            'x': self.x(),
-            'y': self.y()
-        }
-        self.last_saved_x = self.x()
-        self.last_saved_y = self.y()
-        overlay_utils.save_config(config)
-
-    def load_position(self):
-        config = overlay_utils.load_config()
-        pos = config.get('inputs_overlay')
-        if pos:
-            self.move(pos['x'], pos['y'])
-            self.last_saved_x = pos['x']
-            self.last_saved_y = pos['y']
-
-    def closeEvent(self, event):
-        self.data_thread.stop()
-        event.accept()
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     app = QApplication(sys.argv)
-    overlay = InputOverlay()
-    overlay.show()
+    win = InputsOverlay()
+    win.show()
     sys.exit(app.exec_())

@@ -1,247 +1,129 @@
+"""
+fuel_overlay.py - RaceLab / SimHub Pro Fuel & Pit Strategy Calculator
+======================================================================
+Author: vevi (VEVIkils556@gmail.com)
+Version: 3.5 Supreme (Blender 3D PBR + Resizable & Lockable + Clean Typography)
+"""
+
 import sys
 import time
-import os
-from PyQt5.QtWidgets import QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame, QProgressBar
-from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal
-from PyQt5.QtGui import QColor, QFont
+import irsdk
+from PyQt5.QtWidgets import QApplication
+from PyQt5.QtCore import Qt, QTimer, QRectF
+from PyQt5.QtGui import (
+    QPainter, QColor, QFont, QPen, QPainterPath
+)
+from overlay_utils import (
+    get_sim_telemetry, draw_3d_card_bezel, draw_elided_text,
+    ResizableLockableOverlay
+)
 
-import overlay_utils
+OVERLAY_KEY = "fuel_overlay"
+BASE_W, BASE_H = 340, 175
 
-class FuelDataThread(QThread):
-    data_updated = pyqtSignal(dict)
 
+class FuelOverlay(ResizableLockableOverlay):
     def __init__(self):
-        super().__init__()
-        try:
-            import irsdk
-            self.ir = irsdk.IRSDK()
-        except:
-            self.ir = None
-        self.running = True
+        super().__init__(OVERLAY_KEY, BASE_W, BASE_H, default_x=1520, default_y=830)
+        self.ir = irsdk.IRSDK()
+        self.is_connected = False
+        self._sim = get_sim_telemetry(time.time())
 
-    def run(self):
-        while self.running:
-            config = overlay_utils.load_config()
-            sim_mode = config.get("sim_mode", False)
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.update_telemetry)
+        self.timer.start(100)
 
-            if sim_mode:
-                data = overlay_utils.get_sim_telemetry(time.time())
-                self.data_updated.emit(data)
-                time.sleep(1/10)
-                continue
+    def update_telemetry(self):
+        self.sync_window_from_config()
+        sim_data = get_sim_telemetry(time.time())
 
-            if not self.ir:
+        if not self._cfg.get("sim_mode", False):
+            if not self.is_connected:
+                if self.ir.startup():
+                    self.is_connected = True
+            elif not self.ir.is_initialized:
+                self.is_connected = False
+            if self.is_connected:
                 try:
-                    import irsdk
-                    self.ir = irsdk.IRSDK()
-                except:
-                    time.sleep(1)
-                    continue
+                    self.ir.freeze_var_buffer_latest()
+                    fl = float(self.ir["FuelLevel"] or 0.0)
+                    sim_data["fuel_level"] = fl
+                    sim_data["fuel_est_laps"] = fl / max(0.5, sim_data["fuel_per_lap"])
+                except Exception:
+                    pass
 
-            if not (self.ir.is_initialized and self.ir.is_connected):
-                if not self.ir.startup():
-                    time.sleep(1)
-                    continue
+        self._sim = sim_data
+        self.update()
 
-            try:
-                self.ir.freeze_var_buffer_latest()
-                fuel_level = self.ir['FuelLevel'] or 0.0
-                fuel_pct = self.ir['FuelLevelPct'] or 0.0
-                water_temp = self.ir['WaterTemp'] or 85.0
-                oil_temp = self.ir['OilTemp'] or 90.0
+    def paintEvent(self, event):
+        p = self.begin_overlay_painter()
 
-                # Estimated 2.8L per lap if not calculated yet
-                fuel_per_lap = 2.80
-                laps_rem = fuel_level / fuel_per_lap if fuel_per_lap > 0 else 0
+        d = self._sim
+        if not draw_3d_card_bezel(p, 4, 4, BASE_W - 8, BASE_H - 8):
+            bg_path = QPainterPath()
+            bg_path.addRoundedRect(QRectF(6, 6, BASE_W - 12, BASE_H - 12), 12, 12)
+            p.fillPath(bg_path, QColor(12, 15, 22, 242))
 
-                self.data_updated.emit({
-                    'FuelLevel': fuel_level,
-                    'FuelPerLap': fuel_per_lap,
-                    'FuelLapsRemaining': laps_rem,
-                    'WaterTemp': water_temp,
-                    'OilTemp': oil_temp
-                })
-            except:
-                pass
-            time.sleep(1/10)
+        # Header (Strictly separated from PIT WINDOW OK badge)
+        p.setPen(QColor("#FFFFFF"))
+        p.setFont(QFont("Segoe UI", 8, QFont.Black))
+        draw_elided_text(p, QRectF(18, 12, 205, 22), Qt.AlignLeft | Qt.AlignVCenter, "FUEL & PIT STRATEGY")
 
-    def stop(self):
-        self.running = False
-        self.wait()
+        pw_rect = QRectF(BASE_W - 104, 12, 86, 22)
+        p.setBrush(QColor(16, 185, 129, 45))
+        p.setPen(QPen(QColor("#10B981"), 1.2))
+        p.drawRoundedRect(pw_rect, 5, 5)
+        p.setPen(QColor("#10B981"))
+        p.setFont(QFont("Segoe UI", 7, QFont.Black))
+        p.drawText(pw_rect, Qt.AlignCenter, "PIT WINDOW OK")
 
-class FuelOverlay(QWidget):
-    def __init__(self):
-        super().__init__()
-        self.script_dir = overlay_utils.get_base_path()
-        self.current_theme = ""
-        self.current_opacity = 0.0
-        self.current_locked = False
-        self.last_saved_x = -9999
-        self.last_saved_y = -9999
-        self.drag_pos = None
+        # 4 Telemetry Metric Cards
+        cards = [
+            ("REMAINING", f"{d['fuel_level']:.1f} L", "#00F5D4"),
+            ("EST. LAPS", f"{d['fuel_est_laps']:.1f} L", "#10B981" if d['fuel_est_laps'] > 4 else "#EF4444"),
+            ("AVG / LAP", f"{d['fuel_per_lap']:.2f} L", "#FFFFFF"),
+            ("ADD AT PIT", f"+{d['fuel_needed']:.1f} L", "#F59E0B"),
+        ]
+        cw = (BASE_W - 36 - 18) / 4.0
+        for idx, (lbl, val, col) in enumerate(cards):
+            cx = 18 + idx * (cw + 6)
+            c_rect = QRectF(cx, 44, cw, 64)
+            p.setBrush(QColor(18, 22, 34, 235))
+            p.setPen(QPen(QColor(255, 255, 255, 35), 1.0))
+            p.drawRoundedRect(c_rect, 7, 7)
 
-        self.init_ui()
-        QTimer.singleShot(100, self.load_position)
+            p.setPen(QColor("#8E96AA"))
+            p.setFont(QFont("Segoe UI", 6, QFont.Bold))
+            p.drawText(QRectF(cx + 2, 50, cw - 4, 14), Qt.AlignCenter, lbl)
 
-        self.data_thread = FuelDataThread()
-        self.data_thread.data_updated.connect(self.update_view)
-        self.data_thread.start()
+            p.setPen(QColor(col))
+            p.setFont(QFont("Consolas", 10, QFont.Black))
+            p.drawText(QRectF(cx + 2, 68, cw - 4, 30), Qt.AlignCenter, val)
 
-        self.config_timer = QTimer(self)
-        self.config_timer.timeout.connect(self.reload_settings)
-        self.config_timer.start(500)
+        # Fuel Tank Progress Bar
+        bar_bg = QRectF(18, 120, BASE_W - 36, 16)
+        p.setBrush(QColor(24, 28, 40))
+        p.setPen(Qt.NoPen)
+        p.drawRoundedRect(bar_bg, 5, 5)
 
-    def init_ui(self):
-        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
-        self.setAttribute(Qt.WA_TranslucentBackground)
-        self.setFixedSize(320, 110)
+        pct = max(0.0, min(1.0, d["fuel_level"] / 30.0))
+        fill_col = QColor("#10B981") if pct > 0.25 else QColor("#EF4444")
+        p.setBrush(fill_col)
+        p.drawRoundedRect(QRectF(18, 120, (BASE_W - 36) * pct, 16), 5, 5)
 
-        self.container = QFrame(self)
-        self.container.setGeometry(0, 0, 320, 110)
-        self.container.setObjectName("fuelContainer")
+        p.setPen(QColor("#94A3B8"))
+        p.setFont(QFont("Segoe UI", 7, QFont.Bold))
+        draw_elided_text(
+            p,
+            QRectF(18, 142, BASE_W - 36, 18),
+            Qt.AlignCenter,
+            f"SAFE TARGET: {d['fuel_per_lap']*0.96:.2f} L/LAP (LIFT & COAST) | BY VEVI"
+        )
+        self.end_overlay_painter(p)
 
-        layout = QVBoxLayout(self.container)
-        layout.setContentsMargins(14, 10, 14, 10)
-        layout.setSpacing(6)
 
-        # Header
-        header = QHBoxLayout()
-        lbl_title = QLabel("FUEL & STINT CALCULATOR")
-        lbl_title.setStyleSheet("font-size: 9px; font-weight: 900; letter-spacing: 1.5px; color: #8e8e93;")
-        self.lbl_laps_rem = QLabel("~0.0 LAPS")
-        self.lbl_laps_rem.setStyleSheet("font-size: 11px; font-weight: 900; color: #00f5d4;")
-        header.addWidget(lbl_title)
-        header.addStretch()
-        header.addWidget(self.lbl_laps_rem)
-        layout.addLayout(header)
-
-        # Main Fuel Remaining
-        mid = QHBoxLayout()
-        self.lbl_fuel_main = QLabel("45.0")
-        self.lbl_fuel_main.setStyleSheet("font-size: 32px; font-weight: 900; font-family: monospace; color: #ffffff;")
-        lbl_unit = QLabel("LITERS")
-        lbl_unit.setStyleSheet("font-size: 10px; font-weight: 900; color: #8e8e93; margin-top: 14px;")
-
-        mid.addWidget(self.lbl_fuel_main)
-        mid.addWidget(lbl_unit)
-        mid.addStretch()
-
-        # Stats on right
-        stats_col = QVBoxLayout()
-        stats_col.setSpacing(2)
-        self.lbl_per_lap = QLabel("AVG: 2.78 L/LAP")
-        self.lbl_per_lap.setStyleSheet("font-size: 10px; font-weight: bold; color: #cccccc;")
-        self.lbl_temp = QLabel("H2O: 85°C | OIL: 92°C")
-        self.lbl_temp.setStyleSheet("font-size: 9px; font-weight: bold; color: #8e8e93;")
-        stats_col.addWidget(self.lbl_per_lap)
-        stats_col.addWidget(self.lbl_temp)
-        mid.addLayout(stats_col)
-        layout.addLayout(mid)
-
-        # Fuel Level Bar
-        self.fuel_bar = QProgressBar()
-        self.fuel_bar.setFixedHeight(8)
-        self.fuel_bar.setTextVisible(False)
-        self.fuel_bar.setRange(0, 100)
-        self.fuel_bar.setValue(80)
-        self.fuel_bar.setStyleSheet("""
-            QProgressBar {
-                background: rgba(255, 255, 255, 0.08);
-                border-radius: 4px;
-            }
-            QProgressBar::chunk {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #00f5d4, stop:1 #9d4edd);
-                border-radius: 4px;
-            }
-        """)
-        layout.addWidget(self.fuel_bar)
-
-        self.reload_settings()
-
-    def reload_settings(self):
-        config = overlay_utils.load_config()
-        opacity = config.get("opacity", 0.92)
-        if opacity != self.current_opacity:
-            self.setWindowOpacity(opacity)
-            self.current_opacity = opacity
-
-        locked = config.get("locked", False)
-        if locked != self.current_locked:
-            self.setAttribute(Qt.WA_TransparentForMouseEvents, locked)
-            self.current_locked = locked
-
-        pos = config.get('fuel_overlay')
-        if pos:
-            if pos['x'] != self.last_saved_x or pos['y'] != self.last_saved_y:
-                self.move(pos['x'], pos['y'])
-                self.last_saved_x = pos['x']
-                self.last_saved_y = pos['y']
-
-        theme = config.get("theme", "racelab_pro")
-        if theme != self.current_theme:
-            self.current_theme = theme
-            colors = overlay_utils.get_theme_colors(theme)
-            self.container.setStyleSheet(f"""
-                #fuelContainer {{
-                    background: {colors["bg_gradient"]};
-                    border: 1.5px solid {colors["border"]};
-                    border-radius: 10px;
-                }}
-            """)
-
-    def update_view(self, data):
-        fuel = data.get('FuelLevel', 0.0)
-        laps_rem = data.get('FuelLapsRemaining', 0.0)
-        per_lap = data.get('FuelPerLap', 0.0)
-        w_temp = data.get('WaterTemp', 85.0)
-        o_temp = data.get('OilTemp', 92.0)
-
-        self.lbl_fuel_main.setText(f"{fuel:.1f}")
-        self.lbl_laps_rem.setText(f"~{laps_rem:.1f} LAPS")
-        self.lbl_per_lap.setText(f"AVG: {per_lap:.2f} L/LAP")
-        self.lbl_temp.setText(f"H2O: {w_temp:.0f}°C | OIL: {o_temp:.0f}°C")
-
-        # Assume max capacity ~ 60L or scale
-        pct = min(100, max(0, int((fuel / 60.0) * 100)))
-        self.fuel_bar.setValue(pct)
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton and not self.testAttribute(Qt.WA_TransparentForMouseEvents):
-            self.drag_pos = event.globalPos() - self.frameGeometry().topLeft()
-            event.accept()
-
-    def mouseMoveEvent(self, event):
-        if event.buttons() == Qt.LeftButton and self.drag_pos and not self.testAttribute(Qt.WA_TransparentForMouseEvents):
-            self.move(event.globalPos() - self.drag_pos)
-            event.accept()
-
-    def mouseReleaseEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            self.drag_pos = None
-            self.save_position()
-            event.accept()
-
-    def save_position(self):
-        config = overlay_utils.load_config()
-        config['fuel_overlay'] = {'x': self.x(), 'y': self.y()}
-        self.last_saved_x = self.x()
-        self.last_saved_y = self.y()
-        overlay_utils.save_config(config)
-
-    def load_position(self):
-        config = overlay_utils.load_config()
-        pos = config.get('fuel_overlay')
-        if pos:
-            self.move(pos['x'], pos['y'])
-            self.last_saved_x = pos['x']
-            self.last_saved_y = pos['y']
-
-    def closeEvent(self, event):
-        self.data_thread.stop()
-        event.accept()
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     app = QApplication(sys.argv)
-    overlay = FuelOverlay()
-    overlay.show()
+    win = FuelOverlay()
+    win.show()
     sys.exit(app.exec_())
